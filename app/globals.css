@@ -92,9 +92,15 @@ button:disabled {
 }
 
 .orb {
-  height: 250px;
-  margin: 4px -28px 0;
+  height: 270px;
+  margin: 0 -28px;
   flex: none;
+  cursor: grab;
+  touch-action: pan-y;
+}
+
+.orb:active {
+  cursor: grabbing;
 }
 
 .rail h1 {

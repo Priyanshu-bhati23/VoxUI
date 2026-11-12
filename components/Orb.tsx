@@ -1,6 +1,6 @@
 "use client";
 
-import { Canvas, useFrame } from "@react-three/fiber";
+import { Canvas, useFrame, type ThreeEvent } from "@react-three/fiber";
 import { useMemo, useRef, type RefObject } from "react";
 import * as THREE from "three";
 
@@ -10,6 +10,10 @@ export type OrbMode = "idle" | "listening" | "thinking" | "building";
  * The voice orb: a sphere whose surface is pushed around by 3D noise in a
  * vertex shader. While listening, the push follows the microphone level, so
  * the orb moves with the speaker's voice.
+ *
+ * It is also something to play with: the surface swells toward the pointer,
+ * dragging spins it with a little inertia, a ring of sparks circles it, and
+ * pressing it is the same as pressing the Speak button.
  */
 
 // Simplex noise by Ian McEwan and Stefan Gustavson (MIT licence), the usual GLSL port.
@@ -42,14 +46,19 @@ const VERTEX = /* glsl */ `
 ${NOISE}
 uniform float uTime;
 uniform float uAmp;
+uniform float uHover;
+uniform vec3 uPointer;
 varying float vLift;
+varying float vTouch;
 varying vec3 vNormal;
 varying vec3 vView;
 void main(){
   float slow = snoise(normal * 1.3 + uTime * 0.35);
   float fine = snoise(normal * 3.4 - uTime * 0.6) * 0.35;
   vLift = slow + fine;
-  vec3 moved = position + normal * vLift * uAmp;
+  // The surface swells toward the point under the pointer.
+  vTouch = pow(max(dot(normal, uPointer), 0.0), 7.0) * uHover;
+  vec3 moved = position + normal * (vLift * uAmp + vTouch * 0.3);
   vec4 world = modelViewMatrix * vec4(moved, 1.0);
   vNormal = normalize(normalMatrix * normal);
   vView = normalize(-world.xyz);
@@ -61,24 +70,45 @@ uniform vec3 uLow;
 uniform vec3 uMid;
 uniform vec3 uHigh;
 varying float vLift;
+varying float vTouch;
 varying vec3 vNormal;
 varying vec3 vView;
 void main(){
   float t = smoothstep(-0.9, 0.9, vLift);
   vec3 color = mix(uLow, uMid, smoothstep(0.0, 0.55, t));
   color = mix(color, uHigh, smoothstep(0.55, 1.0, t));
+  color = mix(color, uHigh, vTouch * 0.8);
   float rim = pow(1.0 - max(dot(normalize(vNormal), vView), 0.0), 2.4);
   color += rim * 0.35;
   gl_FragColor = vec4(color, 1.0);
 }`;
 
-function Blob({ mode, level, reducedMotion }: { mode: OrbMode; level: RefObject<number>; reducedMotion: boolean }) {
-  const mesh = useRef<THREE.Mesh>(null);
+interface OrbProps {
+  mode: OrbMode;
+  level: RefObject<number>;
+  reducedMotion: boolean;
+  /** Called when the orb is pressed without being dragged. */
+  onPress?: () => void;
+}
+
+const SPARKS = 800;
+
+function Blob({ mode, level, reducedMotion, onPress }: OrbProps) {
+  const group = useRef<THREE.Group>(null);
+  const material = useRef<THREE.ShaderMaterial>(null);
+  const sparks = useRef<THREE.Points>(null);
   const amp = useRef(0.12);
+  const hover = useRef(0);
+  const hovering = useRef(false);
+  const spin = useRef({ x: 0, y: 0.15 });
+  const drag = useRef<{ x: number; y: number; moved: number } | null>(null);
+
   const uniforms = useMemo(
     () => ({
       uTime: { value: 0 },
       uAmp: { value: 0.12 },
+      uHover: { value: 0 },
+      uPointer: { value: new THREE.Vector3(0, 0, 1) },
       uLow: { value: new THREE.Color("#D81E78") },
       uMid: { value: new THREE.Color("#FF6A45") },
       uHigh: { value: new THREE.Color("#FFD76A") },
@@ -86,34 +116,109 @@ function Blob({ mode, level, reducedMotion }: { mode: OrbMode; level: RefObject<
     [],
   );
 
+  const sparkGeometry = useMemo(() => {
+    const positions = new Float32Array(SPARKS * 3);
+    for (let i = 0; i < SPARKS; i++) {
+      // A loose, tilted band around the orb.
+      const angle = Math.random() * Math.PI * 2;
+      const radius = 1.7 + Math.random() * 0.4;
+      positions[i * 3] = Math.cos(angle) * radius;
+      positions[i * 3 + 1] = (Math.random() - 0.5) * 0.28;
+      positions[i * 3 + 2] = Math.sin(angle) * radius;
+    }
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+    return geometry;
+  }, []);
+
   useFrame((_, dt) => {
     const step = Math.min(dt, 0.05);
+    // Write to the material's own uniforms. The renderer keeps its own copy of
+    // each one, so changing the object passed in as a prop would not reach the shader.
+    const u = material.current?.uniforms;
+    if (!u || !group.current) return;
+
     const speed = reducedMotion ? 0 : mode === "idle" ? 0.5 : mode === "listening" ? 1.1 : 2.2;
-    uniforms.uTime.value += step * speed;
+    u.uTime.value += step * speed;
+    const voice = Math.min(1, level.current * 3.2);
     const target =
       mode === "listening"
-        ? 0.14 + Math.min(1, level.current * 3.2) * 0.5
+        ? 0.14 + voice * 0.5
         : mode === "thinking"
           ? 0.22
           : mode === "building"
-            ? 0.2 + (reducedMotion ? 0 : 0.08 * Math.sin(uniforms.uTime.value * 3))
+            ? 0.2 + (reducedMotion ? 0 : 0.08 * Math.sin(u.uTime.value * 3))
             : 0.11;
     amp.current += (target - amp.current) * (1 - Math.exp(-step * 9));
-    uniforms.uAmp.value = amp.current;
-    if (mesh.current && !reducedMotion) mesh.current.rotation.y += step * 0.15;
+    u.uAmp.value = amp.current;
+
+    hover.current += ((hovering.current ? 1 : 0) - hover.current) * (1 - Math.exp(-step * 8));
+    u.uHover.value = hover.current;
+
+    // Spin: a slow idle turn, plus whatever the last drag left behind.
+    if (!reducedMotion) {
+      if (!drag.current) {
+        spin.current.x *= Math.exp(-step * 2.5);
+        spin.current.y += (0.15 - spin.current.y) * (1 - Math.exp(-step * 1.5));
+      }
+      group.current.rotation.y += spin.current.y * step;
+      group.current.rotation.x = THREE.MathUtils.clamp(group.current.rotation.x + spin.current.x * step, -0.9, 0.9);
+    }
+
+    if (sparks.current) {
+      const busy = mode === "building" || mode === "thinking";
+      if (!reducedMotion) sparks.current.rotation.y -= step * (busy ? 1.6 : 0.35);
+      const reach = 1 + (mode === "listening" ? voice * 0.45 : 0) + hover.current * 0.06;
+      sparks.current.scale.setScalar(sparks.current.scale.x + (reach - sparks.current.scale.x) * (1 - Math.exp(-step * 10)));
+    }
   });
 
+  const pointAt = (e: ThreeEvent<PointerEvent>) => {
+    if (!group.current || !material.current) return;
+    hovering.current = true;
+    material.current.uniforms.uPointer.value.copy(group.current.worldToLocal(e.point.clone())).normalize();
+  };
+
   return (
-    <mesh ref={mesh}>
-      <icosahedronGeometry args={[1.25, 48]} />
-      <shaderMaterial vertexShader={VERTEX} fragmentShader={FRAGMENT} uniforms={uniforms} />
-    </mesh>
+    <group
+      ref={group}
+      onPointerDown={(e) => {
+        (e.target as Element).setPointerCapture?.(e.pointerId);
+        drag.current = { x: e.clientX, y: e.clientY, moved: 0 };
+      }}
+      onPointerMove={(e) => {
+        pointAt(e);
+        if (!drag.current) return;
+        const dx = e.clientX - drag.current.x;
+        const dy = e.clientY - drag.current.y;
+        drag.current = { x: e.clientX, y: e.clientY, moved: drag.current.moved + Math.abs(dx) + Math.abs(dy) };
+        spin.current.y = dx * 0.45;
+        spin.current.x = dy * 0.45;
+      }}
+      onPointerUp={(e) => {
+        (e.target as Element).releasePointerCapture?.(e.pointerId);
+        const wasPress = drag.current !== null && drag.current.moved < 6;
+        drag.current = null;
+        if (wasPress) onPress?.();
+      }}
+      onPointerOut={() => {
+        hovering.current = false;
+      }}
+    >
+      <mesh>
+        <icosahedronGeometry args={[1.25, 48]} />
+        <shaderMaterial ref={material} vertexShader={VERTEX} fragmentShader={FRAGMENT} uniforms={uniforms} />
+      </mesh>
+      <points ref={sparks} geometry={sparkGeometry} rotation={[0.45, 0, 0.25]}>
+        <pointsMaterial color="#FFD76A" size={0.05} sizeAttenuation transparent opacity={0.95} depthWrite={false} />
+      </points>
+    </group>
   );
 }
 
-export default function Orb(props: { mode: OrbMode; level: RefObject<number>; reducedMotion: boolean }) {
+export default function Orb(props: OrbProps) {
   return (
-    <Canvas dpr={[1, 2]} camera={{ position: [0, 0, 4.2], fov: 45 }} gl={{ antialias: true, alpha: true }}>
+    <Canvas dpr={[1, 2]} camera={{ position: [0, 0, 5.2], fov: 45 }} gl={{ antialias: true, alpha: true }}>
       <Blob {...props} />
     </Canvas>
   );

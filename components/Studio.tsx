@@ -259,7 +259,12 @@ export default function Studio() {
         </header>
 
         <div className={`orb orb-${orbMode}`}>
-          <Orb mode={orbMode} level={level} reducedMotion={reducedMotion} />
+          <Orb
+            mode={orbMode}
+            level={level}
+            reducedMotion={reducedMotion}
+            onPress={canRecord && phase === "idle" ? startListening : phase === "listening" ? stopListening : undefined}
+          />
         </div>
 
         {versions.length === 0 && phase === "idle" ? (
@@ -270,7 +275,10 @@ export default function Studio() {
           </p>
         )}
         {versions.length === 0 && phase === "idle" && (
-          <p className="lede">Describe an interface out loud. A working version appears in the window as it is written, and you can change it by talking.</p>
+          <p className="lede">
+            Describe an interface out loud. A working version appears in the window as it is written, and you can change it by talking. Press the orb to
+            speak, or drag it to spin it.
+          </p>
         )}
         {phase === "building" && pending && <p className="heard">&ldquo;{pending}&rdquo;</p>}
 
