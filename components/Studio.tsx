@@ -2,7 +2,7 @@
 
 import dynamic from "next/dynamic";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { cleanHtml, forPreview } from "@/lib/html";
+import { cleanHtml, dropKitOverrides, forExport, forPreview, looksComplete } from "@/lib/html";
 import { SAMPLE_HTML, SAMPLE_REQUEST } from "@/lib/sample";
 import { errorOf, readText } from "@/lib/stream";
 import type { Version } from "@/lib/types";
@@ -58,6 +58,9 @@ export default function Studio() {
   const cleanup = useRef<() => void>(() => {});
   const abort = useRef<AbortController | null>(null);
   const nextId = useRef(1);
+  const frame = useRef<HTMLIFrameElement>(null);
+  const pageErrors = useRef(new Map<number, string[]>());
+  const [fixing, setFixing] = useState(false);
 
   const active = versions.find((v) => v.id === activeId) ?? null;
   const busy = phase !== "idle";
@@ -72,7 +75,7 @@ export default function Studio() {
   }, []);
 
   const build = useCallback(
-    async (request: string) => {
+    async (request: string, repair?: { base: Version; errors: string[] }) => {
       const ask = request.trim();
       if (!ask) return;
       setError("");
@@ -82,13 +85,18 @@ export default function Studio() {
       setPhase("building");
       const controller = new AbortController();
       abort.current = controller;
-      const base = versions.find((v) => v.id === activeId) ?? null;
+      const base = repair?.base ?? versions.find((v) => v.id === activeId) ?? null;
 
       try {
         const res = await fetch("/api/generate", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ request: ask, current: base?.html }),
+          body: JSON.stringify({
+            request: ask,
+            current: base?.html,
+            // What the page was first asked to be, so a vague change ("fix it") has something to aim at.
+            intent: base ? (versions.find((v) => v.source === "ai")?.request ?? base.request) : undefined,
+          }),
           signal: controller.signal,
         });
         if (!res.ok) {
@@ -104,15 +112,20 @@ export default function Studio() {
           const now = performance.now();
           if (now - lastPaint > 320) {
             lastPaint = now;
-            setDraft(cleanHtml(raw));
+            setDraft(dropKitOverrides(cleanHtml(raw)));
           }
         });
 
-        const html = cleanHtml(raw);
+        const html = dropKitOverrides(cleanHtml(raw));
         if (!/<(body|main|div|section)\b/i.test(html)) {
           throw new Error("The model did not return a usable page. Try again, or describe it a little differently.");
         }
-        const version: Version = { id: nextId.current++, request: ask, html, source: "ai" };
+        if (!looksComplete(html)) {
+          setError("The model ran out of room before it finished this page, so parts of it may not work. Ask for a simpler version, or try again in a minute.");
+        }
+        const version: Version = repair
+          ? { id: nextId.current++, request: "Fixed a script error automatically", html, source: "ai", autoFix: true }
+          : { id: nextId.current++, request: ask, html, source: "ai" };
         setVersions((all) => [...all, version]);
         setActiveId(version.id);
         setText("");
@@ -121,10 +134,38 @@ export default function Studio() {
       } finally {
         setPhase("idle");
         setDraft("");
+        setFixing(false);
       }
     },
     [versions, activeId],
   );
+
+  // Collect script errors reported by the preview.
+  useEffect(() => {
+    const onMessage = (e: MessageEvent) => {
+      if (e.source !== frame.current?.contentWindow || typeof e.data?.voxuiError !== "string" || activeId === null) return;
+      const list = pageErrors.current.get(activeId) ?? [];
+      if (!list.includes(e.data.voxuiError)) list.push(e.data.voxuiError);
+      pageErrors.current.set(activeId, list);
+    };
+    window.addEventListener("message", onMessage);
+    return () => window.removeEventListener("message", onMessage);
+  }, [activeId]);
+
+  // A fresh AI version that throws errors is sent back once for a fix.
+  useEffect(() => {
+    if (phase !== "idle" || !active || active.source !== "ai" || active.autoFix) return;
+    const timer = setTimeout(() => {
+      const errors = pageErrors.current.get(active.id);
+      if (!errors?.length || active.id !== versions[versions.length - 1]?.id) return;
+      setFixing(true);
+      build(
+        `The page has these JavaScript errors, so parts of it do not work: ${errors.join("; ")}. Find the cause and fix it. Make sure the main list or feed renders, every button works, and no dialog is open when the page loads.`,
+        { base: active, errors },
+      );
+    }, 1600);
+    return () => clearTimeout(timer);
+  }, [phase, active, versions, build]);
 
   const stopListening = () => recorder.current?.state === "recording" && recorder.current.stop();
 
@@ -220,7 +261,7 @@ export default function Studio() {
   const copy = async () => {
     if (!active) return;
     try {
-      await navigator.clipboard.writeText(active.html);
+      await navigator.clipboard.writeText(forExport(active.html, active.source === "ai"));
       setCopied(true);
       setTimeout(() => setCopied(false), 1600);
     } catch {
@@ -230,7 +271,7 @@ export default function Studio() {
 
   const download = () => {
     if (!active) return;
-    const url = URL.createObjectURL(new Blob([active.html], { type: "text/html" }));
+    const url = URL.createObjectURL(new Blob([forExport(active.html, active.source === "ai")], { type: "text/html" }));
     const link = document.createElement("a");
     link.href = url;
     link.download = "voxui.html";
@@ -243,7 +284,7 @@ export default function Studio() {
     idle: active ? "Say a change, or type it below." : "Press the button and describe an interface.",
     listening: "Listening. Press again when you are done.",
     transcribing: "Turning your words into text",
-    building: "Building it",
+    building: fixing ? "Found a bug in the page. Fixing it" : "Planning it, then building it",
   }[phase];
 
   return (
@@ -406,10 +447,11 @@ export default function Studio() {
             <div className={`frame frame-${width} ${phase === "building" ? "frame-building" : ""}`}>
               {/* Generated code is untrusted: no same-origin access, and scripts only once the document is complete. */}
               <iframe
+                ref={frame}
                 key={phase === "building" ? "draft" : `v${activeId}`}
                 title="Preview of the generated interface"
                 sandbox={phase === "building" ? "" : "allow-scripts allow-forms"}
-                srcDoc={forPreview(shown) || "<!DOCTYPE html><title>Preview</title>"}
+                srcDoc={forPreview(shown, phase === "building" || active?.source === "ai", phase !== "building" && active?.source === "ai") || "<!DOCTYPE html><title>Preview</title>"}
               />
               {active?.source === "sample" && phase !== "building" && <span className="badge">Hand-written sample, not AI output</span>}
             </div>

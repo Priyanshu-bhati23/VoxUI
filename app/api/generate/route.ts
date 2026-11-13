@@ -1,31 +1,57 @@
-import { MODELS, chatStream, errorResponse, hasKey, GroqError } from "@/lib/groq";
+import { MODELS, chat, chatStream, errorResponse, hasKey, GroqError } from "@/lib/groq";
+import { BRIEF_SYSTEM, BUILD_SYSTEM, EDIT_NOTE } from "@/lib/prompts";
 import { clientId, overLimit, tooMany } from "@/lib/ratelimit";
 import { textStream } from "@/lib/stream";
 
 export const maxDuration = 60;
 
-const MAX_OUTPUT_TOKENS = Number(process.env.GROQ_MAX_OUTPUT_TOKENS) || 4500;
-const MAX_CURRENT_CHARS = 16_000;
+/**
+ * Groq counts the prompt plus the requested output against a tokens-per-minute
+ * limit, and rejects a request that is larger than the whole limit. The free
+ * plan allows 8,000 for this model, so the output budget is whatever the prompt leaves.
+ */
+const TOKENS_PER_MINUTE = Number(process.env.GROQ_TPM_LIMIT) || 8000;
+const MAX_OUTPUT_TOKENS = Number(process.env.GROQ_MAX_OUTPUT_TOKENS) || 6400;
+const MAX_CURRENT_CHARS = 14_000;
+const REASONING = (process.env.GROQ_REASONING_EFFORT as "low" | "medium" | "high" | undefined) ?? "medium";
 
-const SYSTEM = `You are a senior front-end engineer. You turn a short spoken request into a small, working web interface.
+/** A rough token count: about one token for every 3.3 characters of code or English. */
+const estimateTokens = (text: string) => Math.ceil(text.length / 3.3);
 
-Output exactly one complete HTML document and nothing else. No Markdown fences, no explanation.
+function outputBudget(...promptParts: string[]): number {
+  const prompt = promptParts.reduce((sum, part) => sum + estimateTokens(part), 0);
+  return Math.max(1200, Math.min(MAX_OUTPUT_TOKENS, TOKENS_PER_MINUTE - prompt - 250));
+}
 
-Rules:
-- Start with <!DOCTYPE html>. Put all CSS in one <style> in the head and all JavaScript in one <script> at the end of the body.
-- Plain HTML, CSS and JavaScript only. No frameworks.
-- No network: no external URLs of any kind. No CDNs, web fonts, remote images, fetch or XHR. Use system fonts, CSS shapes, inline SVG and emoji.
-- It must work: every button, input and toggle does what its label says. Keep state in JavaScript variables.
-- Fill it with realistic sample content. Never use lorem ipsum.
-- Make it look designed: a clear colour palette, good spacing, readable type, visible focus states. It must fit a 360px wide screen and a desktop.
-- Label every control. Use real <button>, <label> and <input> elements.
-- Stay under 260 lines.`;
-
-const EDIT_NOTE = `You are given the current document and a change request. Apply the change, keep everything else working, and return the full updated document.`;
+/** Ask the fast model what the person most likely wants. Falls back to the raw request. */
+async function writeBrief(request: string, signal: AbortSignal): Promise<string> {
+  try {
+    const reply = await chat(
+      {
+        model: MODELS.fast,
+        temperature: 0.5,
+        max_completion_tokens: 700,
+        reasoning_effort: "low",
+        include_reasoning: false,
+        messages: [
+          { role: "system", content: BRIEF_SYSTEM },
+          { role: "user", content: request },
+        ],
+      },
+      { signal },
+    );
+    return (reply.message.content ?? "").trim().slice(0, 1800);
+  } catch (err) {
+    // A missing or rejected key should surface. Anything else: build from the request alone.
+    if (err instanceof GroqError && (err.code === "no_key" || err.code === "bad_key")) throw err;
+    return "";
+  }
+}
 
 /**
- * POST /api/generate {request, current?}
- * Streams one HTML document. When "current" is sent, the request is treated as
+ * POST /api/generate {request, current?, intent?}
+ * Streams one HTML document. A new build first expands the request into a
+ * brief, then builds from it. When "current" is sent, the request is treated as
  * a change to that document.
  */
 export async function POST(req: Request) {
@@ -36,24 +62,30 @@ export async function POST(req: Request) {
     const body = await req.json();
     const request = String(body.request ?? "").trim().slice(0, 800);
     const current = typeof body.current === "string" ? body.current.slice(0, MAX_CURRENT_CHARS) : "";
+    const intent = String(body.intent ?? "").trim().slice(0, 400);
     if (!request) return Response.json({ error: "Say or type what to build first.", code: "empty" }, { status: 400 });
+
+    let system = BUILD_SYSTEM;
+    let user: string;
+    if (current) {
+      system = `${BUILD_SYSTEM}\n\n${EDIT_NOTE}`;
+      user = `What it was meant to be: ${intent || "not recorded"}\n\nCurrent document:\n${current}\n\nChange request: ${request}`;
+    } else {
+      const brief = await writeBrief(request, req.signal);
+      user = `The person asked for: "${request}"${brief ? `\n\nWhat that means:\n${brief}` : ""}\n\nInvent all the sample content yourself: at least eight realistic items in every feed, list or table.`;
+    }
 
     const parts = chatStream(
       {
         model: MODELS.smart,
-        temperature: 0.6,
-        max_completion_tokens: MAX_OUTPUT_TOKENS,
-        reasoning_effort: "low",
+        temperature: 0.5,
+        max_completion_tokens: outputBudget(system, user),
+        reasoning_effort: REASONING,
         include_reasoning: false,
-        messages: current
-          ? [
-              { role: "system", content: `${SYSTEM}\n\n${EDIT_NOTE}` },
-              { role: "user", content: `Current document:\n${current}\n\nChange request: ${request}` },
-            ]
-          : [
-              { role: "system", content: SYSTEM },
-              { role: "user", content: `Build this: ${request}` },
-            ],
+        messages: [
+          { role: "system", content: system },
+          { role: "user", content: user },
+        ],
       },
       { signal: req.signal },
     );
